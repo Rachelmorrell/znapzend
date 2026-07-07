@@ -47,7 +47,9 @@ has backupSets => sub { [] };
 
 ### private functions ###
 my $splitHostDataSet = sub {
-    return ($_[0] =~ /^(?:([^:\/]+):)?([^:]+|[^:@]+\@.+)$/);
+    #return ($_[0] =~ /^(?:([^:\/]+):)?([^:]+|[^:@]+\@.+)$/);
+    # See https://github.com/oetiker/znapzend/pull/585
+    return ($_[0] =~ /^(?:([^:\/]+):)?([^@\s]+|[^@\s]+\@[^@\s]+)$/);
 };
 
 ### private methods ###
@@ -84,7 +86,12 @@ my $checkBackupSets = sub {
     my $self = shift;
 
     for my $backupSet (@{$self->backupSets}){
-
+        # Note that we only normally call this either when we walk all
+        # known backup/retention schedules (datasets with at least one
+        # local "org.znapzend:..." property), or just once for a single
+        # "--runonce=..." backupSet (not recursing into children with
+        # their exceptional settings then, unless also "--recursive").
+        #
         # In case there is only one property on this dataset, which is the
         # "enabled" flag and is set to "off"; consider it a normal situation
         # and do not even notify it. This situation will appear when there
@@ -92,8 +99,41 @@ my $checkBackupSets = sub {
         # Note: backupSets will have at least the key "src". Therefore, we
         # need to skip the dataset if there are two properties and one of
         # them is "enabled".
-        if (keys(%{$backupSet}) eq 2 && exists($backupSet->{"enabled"})){
-           next;
+        #
+        # Similarly for datasets which declare both the "enabled" flag and
+        # the "recursion" flag (e.g. to prune whole dataset sub-trees from
+        # backing up with znapzend) by configuring only the root of such
+        # sub-tree.
+        #
+        # Likewise, skip checking datasets (enabled or not) that have only
+        # an autoCreation setting for particular destination(s); note that
+        # ZFS property names must be lower-case (so "c" is small here).
+        # Hence we prepare a filtered set of configuration keys ("dst" name
+        # tags are user-provided and not too predictable), so only "src"
+        # would remain there:
+        my @backupSetKeysFiltered = grep (!/^dst_[^_]+_autocreation$/, keys(%{$backupSet}));
+        my @backupSetKeysFilteredAway = grep (/^dst_[^_]+_autocreation$/, keys(%{$backupSet}));
+        my $backupSetKeysFiltered = scalar(@backupSetKeysFiltered);
+        my $backupSetKeysFilteredAway = scalar(@backupSetKeysFilteredAway);
+        $self->zLog->debug("#checkBackupSets# backupSetKeysFiltered "
+            . "for '" . $backupSet->{src} . "' = ("
+            . $backupSetKeysFiltered . ")["
+            .  join(", ", @backupSetKeysFiltered) . "] "
+            . "and backupSetKeysFilteredAway (not impacting some of the checks) = ("
+            . $backupSetKeysFilteredAway . ")["
+            .  join(", ", @backupSetKeysFilteredAway) . "]"
+            ) if $self->debug;
+
+        # "src" and "enabled", or "src" alone (after disregarding autocreation):
+        if ( ($backupSetKeysFiltered eq 2 and exists($backupSet->{"enabled"}))
+            or $backupSetKeysFiltered eq 1
+        ) {
+            next;
+        }
+
+        # "src", "enabled" and "recursion" (after disregarding autocreation):
+        if ($backupSetKeysFiltered eq 3 && exists($backupSet->{"enabled"}) && exists($backupSet->{"recursive"})){
+            next;
         }
 
         if ( $backupSet->{src} =~ m/[\@]/ ) {
@@ -146,27 +186,115 @@ my $checkBackupSets = sub {
                     or die "ERROR: property $prop is not valid on dataset " . $backupSet->{src} . "\n";
             }
         }
+
+        # Extra mbuffer arguments (e.g. '-R 10M' to rate-limit). Mirrors the
+        # mbuffer_size scheme: a general 'mbuffer_param' acts as the fallback
+        # default for the per-direction 'src_mbuffer_param' and
+        # 'dst_<key>_mbuffer_param' (handled below). Defaults to empty (no extra
+        # arguments) when not configured.
+        if (!exists($backupSet->{mbuffer_param}) or !defined($backupSet->{mbuffer_param})) {
+            $backupSet->{mbuffer_param} = '';
+        }
+
+        # mbuffer properties not set for source? legacy behavior was to not use
+        # any on the sender, except when in port-to-port mode
+        if (!exists($backupSet->{src_mbuffer}) or !($backupSet->{src_mbuffer})) {
+            # Have *something* defined to avoid further exists() checks at least
+            $backupSet->{src_mbuffer} = undef;
+            if ($backupSet->{mbuffer}) {
+                if ($backupSet->{mbuffer} eq 'off') {
+                    # Only use the setting for source if legacy "off" is set
+                    $backupSet->{src_mbuffer} = $backupSet->{mbuffer};
+                    $self->zLog->info("WARNING: property 'src_mbuffer' not set on backup for " . $backupSet->{src} . ", inheriting 'off' from legacy 'mbuffer'");
+                } else {
+                    my ($mbuffer, $mbufferPort) = split /:/, $backupSet->{mbuffer}, 2;
+                    #check if port is numeric
+                    if ($mbufferPort &&
+                        $mbufferPort =~ /^\d{1,5}$/ && int($mbufferPort) < 65535
+                    ) {
+                        # Only use the setting for source program if the legacy
+                        # "/path/to/mbuffer:port" is set (note we would use a
+                        # port defined by each destination separately - maybe
+                        # inherited from the legacy setting, maybe re-defined
+                        # locally or even avoided for that destination link).
+                        $backupSet->{src_mbuffer} = $mbuffer;
+                        $self->zLog->info("WARNING: property 'src_mbuffer' not set on backup for " . $backupSet->{src} . ", inheriting path from legacy 'mbuffer': " . $backupSet->{src_mbuffer});
+                    }
+                }
+            }
+        }
+        if ($backupSet->{src_mbuffer}) {
+            if ($backupSet->{src_mbuffer} ne 'off' and !($self->zfs->fileExistsAndExec($backupSet->{src_mbuffer}))) {
+                warn "*** WARNING: executable '$backupSet->{src_mbuffer}' does not exist on source system, will ignore\n\n";
+                $backupSet->{src_mbuffer} = undef;
+            }
+        }
+        if (!($backupSet->{src_mbuffer})) {
+            # Do not leave loose ends after all
+            $self->zLog->info("WARNING: property 'src_mbuffer' not set on backup for " . $backupSet->{src} . ", defaulting to 'off'");
+            $backupSet->{src_mbuffer} = 'off';
+        }
+        if (!exists($backupSet->{src_mbuffer_size}) or !($backupSet->{src_mbuffer_size})) {
+            $backupSet->{src_mbuffer_size} = $backupSet->{mbuffer_size};
+            $self->zLog->info("WARNING: property 'src_mbuffer_size' not set on backup for " . $backupSet->{src} . ", inheriting from legacy 'mbuffer_size': " . $backupSet->{src_mbuffer_size}) if $backupSet->{src_mbuffer_size};
+        }
+        if (!exists($backupSet->{src_mbuffer_param}) or !($backupSet->{src_mbuffer_param})) {
+            $backupSet->{src_mbuffer_param} = $backupSet->{mbuffer_param};
+            $self->zLog->info("WARNING: property 'src_mbuffer_param' not set on backup for " . $backupSet->{src} . ", inheriting from general 'mbuffer_param': " . $backupSet->{src_mbuffer_param}) if $backupSet->{src_mbuffer_param};
+        }
+        #a non-empty mbuffer_param must parse as shell words; unbalanced quoting
+        #would otherwise silently drop all the extra arguments at send time
+        if ($backupSet->{src_mbuffer_param} =~ /\S/) {
+            my @w = shellwords($backupSet->{src_mbuffer_param});
+            @w or die "ERROR: src_mbuffer_param '" . $backupSet->{src_mbuffer_param} . "' could not be parsed (check quoting)\n";
+        }
+
         #check destination plans and datasets
         for my $dst (grep { /^dst_[^_]+$/ } keys %$backupSet){
             #store backup destination validity. will be checked where used
             $backupSet->{$dst . '_valid'} = $self->zfs->dataSetExists($backupSet->{$dst});
+            $self->zLog->debug('checkBackupSets(): detected ' . $dst . '_valid status for ' . $backupSet->{$dst} . ': ' . $backupSet->{$dst . '_valid'}) if ($self->debug);
 
             #if a backup destination is given, we also need a plan
             $backupSet->{$dst . '_plan'} or die "ERROR: no backup plan given for destination\n";
 
             $backupSet->{$dst . '_plan'} = $self->$checkBackupPlan($backupSet->{$dst . '_plan'});
 
+            # mbuffer properties not set for destination? inherit the legacy default ones.
+            if (!exists($backupSet->{$dst . '_mbuffer'}) or !($backupSet->{$dst . '_mbuffer'})) {
+                ###if ($backupSet->{mbuffer}) {
+                    $backupSet->{$dst . '_mbuffer'} = $backupSet->{mbuffer};
+                ### Do not preclude inheritance when legacy setting changes
+                ###} else {
+                ###    $backupSet->{$dst . '_mbuffer'} = 'off';
+                ###}
+                $self->zLog->info("WARNING: property '" . $dst . "_mbuffer' not set on backup for " . $backupSet->{src} . ", inheriting path[:port] from legacy 'mbuffer': " . $backupSet->{$dst . '_mbuffer'}) if $backupSet->{$dst . '_mbuffer'};
+            }
+            if (!exists($backupSet->{$dst . '_mbuffer_size'}) or !($backupSet->{$dst . '_mbuffer_size'})) {
+                $backupSet->{$dst . '_mbuffer_size'} = $backupSet->{mbuffer_size};
+                $self->zLog->info("WARNING: property '" . $dst . "_mbuffer_size' not set on backup for " . $backupSet->{src} . ", inheriting from legacy 'mbuffer_size': " . $backupSet->{$dst . '_mbuffer_size'}) if $backupSet->{$dst . '_mbuffer_size'};
+            }
+            if (!exists($backupSet->{$dst . '_mbuffer_param'}) or !($backupSet->{$dst . '_mbuffer_param'})) {
+                $backupSet->{$dst . '_mbuffer_param'} = $backupSet->{mbuffer_param};
+                $self->zLog->info("WARNING: property '" . $dst . "_mbuffer_param' not set on backup for " . $backupSet->{src} . ", inheriting from general 'mbuffer_param': " . $backupSet->{$dst . '_mbuffer_param'}) if $backupSet->{$dst . '_mbuffer_param'};
+            }
+            if ($backupSet->{$dst . '_mbuffer_param'} =~ /\S/) {
+                my @w = shellwords($backupSet->{$dst . '_mbuffer_param'});
+                @w or die "ERROR: " . $dst . "_mbuffer_param '" . $backupSet->{$dst . '_mbuffer_param'} . "' could not be parsed (check quoting)\n";
+            }
+
             # mbuffer property set? check if executable is available on remote host
-            if ($backupSet->{mbuffer} ne 'off'){
-                my ($mbuffer, $mbufferPort) = split /:/, $backupSet->{mbuffer}, 2;
+            if ($backupSet->{$dst . '_mbuffer'} ne 'off') {
+                my ($mbuffer, $mbufferPort) = split /:/, $backupSet->{$dst . '_mbuffer'}, 2;
                 my ($remote, $dataset) = $splitHostDataSet->($backupSet->{$dst});
                 my $file = ($remote ? "$remote:" : '') . $mbuffer;
                 $self->zfs->fileExistsAndExec($file)
-                    or warn "*** WARNING: executable '$mbuffer' does not exist" . ($remote ? " on $remote\n\n" : "\n\n");
+                    or warn "*** WARNING: executable '$mbuffer' does not exist on " . ($remote ? "remote $remote" : "local") . " system, zfs receive can fail\n\n";
+                    # TOTHINK: Reset to 'off'/undef and ignore the validity checks below?
 
                 #check if mbuffer size is valid
-                $backupSet->{mbuffer_size} =~ /^\d+[bkMG%]?$/
-                    or die "ERROR: mbuffer size '" . $backupSet->{mbuffer_size} . "' invalid\n";
+                $backupSet->{$dst . '_mbuffer_size'} =~ /^\d+[bkMG%]?$/
+                    or die "ERROR: mbuffer size '" . $backupSet->{$dst . '_mbuffer_size'} . "' invalid\n";
                 #check if port is numeric
                 $mbufferPort && do {
                     $mbufferPort =~ /^\d{1,5}$/ && int($mbufferPort) < 65535
@@ -174,7 +302,20 @@ my $checkBackupSets = sub {
                 };
             }
         }
-        #drop destination plans where destination is not given (e.g. calling create w/o a destination but a plan
+        #warn if extra mbuffer arguments were requested but no mbuffer stage is
+        #enabled at all (all src/dst mbuffer are 'off'): they cannot take effect
+        {
+            my $anyMbuffer = (defined($backupSet->{src_mbuffer}) && $backupSet->{src_mbuffer} ne 'off');
+            my $anyParam   = ($backupSet->{src_mbuffer_param} =~ /\S/);
+            for my $dst (grep { /^dst_[^_]+$/ } keys %$backupSet){
+                $anyMbuffer ||= (defined($backupSet->{$dst . '_mbuffer'}) && $backupSet->{$dst . '_mbuffer'} ne 'off');
+                $anyParam   ||= ($backupSet->{$dst . '_mbuffer_param'} =~ /\S/);
+            }
+            $self->zLog->warn("WARNING: mbuffer_param is set on backup for " . $backupSet->{src} . " but no mbuffer is enabled (all src/dst mbuffer are 'off'); the extra arguments will have no effect")
+                if ($anyParam && !$anyMbuffer);
+        }
+
+        #drop destination plans where destination is not given (e.g. calling create w/o a destination but a plan)
         for my $dst (grep { /^dst_[^_]+_plan$/ } keys %$backupSet){
             $dst =~ s/_plan//; #remove trailing '_plan' so we get destination
 
@@ -433,6 +574,144 @@ sub disableBackupSetDst {
 
         if ($cfg{$dest}) {
             $cfg{$dest . '_enabled'} = 'off';
+        } else {
+            die "ERROR: dataset $dataSet backup plan does not have destination $dest\n";
+        }
+        $self->setBackupSet(\%cfg);
+
+        return 1;
+    }
+
+    return 0;
+}
+
+sub enableBackupSetDstAutoCreation {
+    my $self = shift;
+    my $dataSet = shift;
+    my $dest = shift;
+    my $recurse = shift; # may be undef
+    my $inherit = shift; # may be undef
+
+    $self->zfs->dataSetExists($dataSet) or die "ERROR: dataset $dataSet does not exist\n";
+
+    $self->backupSets($self->zfs->getDataSetProperties($dataSet, $recurse, $inherit));
+
+    if (@{$self->backupSets}){
+        my %cfg = %{$self->backupSets->[0]};
+
+        if ( !($dest =~ /^dst_[^_]+$/) ) {
+            if ($cfg{'dst_' . $dest}) {
+                # User passed valid key of the destination config,
+                # convert to zfs attribute/perl struct name part
+                $dest = 'dst_' . $dest;
+            } elsif ($dest =~ /^DST:/) {
+                my $desttemp = $dest;
+                $desttemp =~ s/^DST:// ;
+                if ($cfg{'dst_' . $desttemp}) {
+                    # User passed valid key of the destination config,
+                    # convert to zfs attribute/perl struct name part
+                    $dest = 'dst_' . $desttemp;
+                }
+            }
+            # TODO: Else search by value of 'dst_N' as a "(remote@)dataset"
+        }
+
+        if ($cfg{$dest}) {
+            $self->zLog->debug("#enableBackupSetDstAutoCreation# applying to dest=$dest of $dataSet backup plan") if $self->debug;
+            $cfg{$dest . '_autocreation'} = 'on';
+        } else {
+            die "ERROR: dataset $dataSet backup plan does not have destination $dest\n";
+        }
+        $self->setBackupSet(\%cfg);
+
+        return 1;
+    }
+
+    $self->zLog->debug("#enableBackupSetDstAutoCreation# found no backupSets for $dataSet backup plan") if $self->debug;
+    return 0;
+}
+
+sub disableBackupSetDstAutoCreation {
+    my $self = shift;
+    my $dataSet = shift;
+    my $dest = shift;
+    my $recurse = shift; # may be undef
+    my $inherit = shift; # may be undef
+
+    $self->zfs->dataSetExists($dataSet) or die "ERROR: dataset $dataSet does not exist\n";
+
+    $self->backupSets($self->zfs->getDataSetProperties($dataSet, $recurse, $inherit));
+
+    if (@{$self->backupSets}){
+        my %cfg = %{$self->backupSets->[0]};
+
+        if ( !($dest =~ /^dst_[^_]+$/) ) {
+            if ($cfg{'dst_' . $dest}) {
+                # User passed valid key of the destination config,
+                # convert to zfs attribute/perl struct name part
+                $dest = 'dst_' . $dest;
+            } elsif ($dest =~ /^DST:/) {
+                my $desttemp = $dest;
+                $desttemp =~ s/^DST:// ;
+                if ($cfg{'dst_' . $desttemp}) {
+                    # User passed valid key of the destination config,
+                    # convert to zfs attribute/perl struct name part
+                    $dest = 'dst_' . $desttemp;
+                }
+            }
+            # TODO: Else search by value of 'dst_N' as a "(remote@)dataset"
+        }
+
+        if ($cfg{$dest}) {
+            $self->zLog->debug("#disableBackupSetDstAutoCreation# applying to dest=$dest of $dataSet backup plan") if $self->debug;
+            $cfg{$dest . '_autocreation'} = 'off';
+        } else {
+            die "ERROR: dataset $dataSet backup plan does not have destination $dest\n";
+        }
+        $self->setBackupSet(\%cfg);
+
+        return 1;
+    }
+
+    $self->zLog->debug("#disableBackupSetDstAutoCreation# found no backupSets for $dataSet backup plan") if $self->debug;
+    return 0;
+}
+
+sub inheritBackupSetDstAutoCreation {
+    my $self = shift;
+    my $dataSet = shift;
+    my $dest = shift;
+    my $recurse = shift; # may be undef
+    my $inherit = shift; # may be undef
+
+    $self->zfs->dataSetExists($dataSet) or die "ERROR: dataset $dataSet does not exist\n";
+
+    $self->backupSets($self->zfs->getDataSetProperties($dataSet, $recurse, $inherit));
+
+    if (@{$self->backupSets}){
+        my %cfg = %{$self->backupSets->[0]};
+
+        if ( !($dest =~ /^dst_[^_]+$/) ) {
+            if ($cfg{'dst_' . $dest}) {
+                # User passed valid key of the destination config,
+                # convert to zfs attribute/perl struct name part
+                $dest = 'dst_' . $dest;
+            } elsif ($dest =~ /^DST:/) {
+                my $desttemp = $dest;
+                $desttemp =~ s/^DST:// ;
+                if ($cfg{'dst_' . $desttemp}) {
+                    # User passed valid key of the destination config,
+                    # convert to zfs attribute/perl struct name part
+                    $dest = 'dst_' . $desttemp;
+                }
+            }
+            # TODO: Else search by value of 'dst_N' as a "(remote@)dataset"
+        }
+
+        if ($cfg{$dest}) {
+            if ($cfg{$dest . '_autocreation'}) {
+                $cfg{$dest . '_autocreation'} = undef;
+            }
         } else {
             die "ERROR: dataset $dataSet backup plan does not have destination $dest\n";
         }

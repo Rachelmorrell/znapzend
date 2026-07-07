@@ -1,7 +1,7 @@
 package ZnapZend;
 
 use Mojo::Base -base;
-use Mojo::IOLoop::ForkCall;
+use Mojo::IOLoop::Subprocess;
 use Mojo::Log;
 use ZnapZend::Config;
 use ZnapZend::ZFS;
@@ -49,12 +49,15 @@ has pidfile                 => sub { q{} };
 has forcedSnapshotSuffix    => sub { q{} };
 has defaultPidFile          => sub { q{/var/run/znapzend.pid} };
 has terminate               => sub { 0 };
-has autoCreation            => sub { 0 };
+has autoCreation            => sub { undef };
 has timeWarp                => sub { undef };
 has nodelay                 => sub { 0 };
 has skipOnPreSnapCmdFail    => sub { 0 };
 has skipOnPreSendCmdFail    => sub { 0 };
 has cleanOffline            => sub { 0 };
+has maxConcurrentSends      => sub { 0 };
+has _activeSends            => sub { 0 };
+has _sendQueue              => sub { [] };
 has 'mailErrorSummaryTo';
 has backupSets              => sub { [] };
 
@@ -100,8 +103,7 @@ has zLog => sub {
                :                                   $self->logto,
         level => $level
     );
-
-    $syslog && do {
+    if ($syslog) {
         $log->unsubscribe('message');
         #add syslog handler if either syslog is explicitly specified or no logfile is given
         openlog(basename($0), 'cons,pid', $syslog);
@@ -111,7 +113,11 @@ has zLog => sub {
                 syslog($logLevels{$level}, @lines) if $log->is_level($level);
             }
         );
-    };
+    }
+    else {
+        $log->with_roles('+Clearable');
+        $SIG{USR1} = sub { $log->clear_handle };
+    }
 
     return $log;
 };
@@ -142,6 +148,215 @@ my $killThemAll = sub {
     exit 0;
 };
 
+# Return an array of dataset names which are local descendants of the
+# provided $backupSet->{src} and have an explicit org.znapzend:enabled=off
+# and/or an intermediate nearest ancestor which is disabled with recursion.
+# The array may be empty if not in recursive mode, or no descendants
+# exist, or none are disabled.
+my $listDisabledSourceDescendants = sub {
+    my $self = shift;
+    my $backupSet = shift;
+
+    #no HUP handler in child
+    $SIG{HUP} = 'IGNORE';
+
+    my @dataSetsExplicitlyDisabled = ();
+
+    my %explicitEnabled = ();
+    my %explicitRecursiveLocal = ();
+    my %explicitRecursiveInherited = ();
+
+    if ($backupSet->{recursive} eq 'on') {
+        $self->zLog->info("checking for explicitly excluded ZFS dependent datasets under '$backupSet->{src}'");
+
+        # restrict the list to the datasets that are descendant from the current
+        ###my @dataSetList = grep /^$backupSet->{src}($|\/)/, @{$self->zZfs->listDataSets()};
+        my @dataSetList = @{$self->zZfs->listDataSets(undef, $backupSet->{src}, 1)};
+
+        if (@dataSetList) {
+            # the default sub-dataset enablement value is implicitly "on"
+            # (technically, the value inherited from $backupSet which we
+            # are currently processing, because it is enabled)
+            my $enabled_default = 'on';
+            if (defined($backupSet->{enabled})) {
+                $enabled_default = $backupSet->{enabled};
+            }
+
+            # for each sub-dataset: if the property "enabled" is set to "off", set the
+            # newly created snapshot for removal
+            for my $dataSet (@dataSetList){
+                # get the value for org.znapzend property
+                my @cmdLE = (@{$self->zZfs->priv}, qw(zfs get -H -s local -o value org.znapzend:enabled), $dataSet);
+                print STDERR '# ' . join(' ', @cmdLE) . "\n" if $self->debug;
+                open my $cmdOutLE, '-|', @cmdLE;
+
+                my @cmdLR = (@{$self->zZfs->priv}, qw(zfs get -H -s local -o value org.znapzend:recursive), $dataSet);
+                print STDERR '# ' . join(' ', @cmdLR) . "\n" if $self->debug;
+                open my $cmdOutLR, '-|', @cmdLR;
+
+                # if the property does not exist, the command will just return.
+                # In this case, use the default determined above.
+                my $propLE = <$cmdOutLE>; # || $enabled_default;
+                if ($propLE) {
+                    chomp($propLE);
+                }
+
+                my $propLR = <$cmdOutLR>;
+                my $propIR;
+                if ($propLR) {
+                    chomp($propLR);
+                } else {
+                    my @cmdIR = (@{$self->zZfs->priv}, qw(zfs get -H -s inherited -o value org.znapzend:recursive), $dataSet);
+                    print STDERR '# ' . join(' ', @cmdIR) . "\n" if $self->debug;
+                    open my $cmdOutIR, '-|', @cmdIR;
+
+                    $propIR = <$cmdOutIR>;
+                    if ($propIR) {
+                        chomp($propIR);
+                    }
+                }
+
+                # ASSUMPTION: We process the dataSetList in alphanumeric
+                # order, so parent datasets were seen before child ones!
+                $explicitEnabled{$dataSet} = $propLE;
+                $explicitRecursiveLocal{$dataSet} = $propLR;
+                $explicitRecursiveInherited{$dataSet} = $propIR;
+
+                $self->zLog->debug("=== $dataSet snapshotting:" .
+                    " enabled=" . (defined($propLE) ? $propLE : "<undef>") .
+                    " recursive=" . (defined($propLR) ? $propLR : "<undef>") .
+                    " (inherited_recursive=" . (defined($propIR) ? $propIR : "<undef>") . ")"
+                    ) if $self->debug;
+
+                # We treat a dataset as individually not-enabled for backup
+                # snapshot processing if either:
+                # * its local enabled==off, whatever the recursive setting
+                # * the nearest ancestor with a local setting about this has
+                #   both enabled==off and recursive==on (explicitly set in it)
+                # Note that a dataset, whose nearest ancestor has enabled==off
+                # but does not set (or enable as "on") the "recursive" option,
+                # would be backed up as usual.
+                # In case of partial pruning and un-pruning, for a sub-dataset
+                # whose nearest ancestor has enabled==on again (which may also
+                # re-define the "recursive" option), a ZFS-inherited definition
+                # of "recursive" would be used.
+                # It is not valid for a single dataset configuration to only
+                # specify "recursive" (however, specifying only "enabled" is
+                # valid, as well as specifying "enabled" and "recursive" as
+                # the only two local znapzend-related properties).
+
+                # Is this source dataset not-enabled for snapshotting? Tri-state:
+                # -1  Known enabled (loop to next item)
+                #  0  Continue investigating
+                #  1  Known disabled (add to output list)
+                my $isDisabled = 0;
+
+                # Is the local "enabled" property value set for this dataset?
+                if (defined($propLE)) {
+                    if ($propLE eq 'off') { $isDisabled = 1; }
+                    elsif ($propLE eq 'on') { $isDisabled = -1; }
+                }
+
+                if (!$isDisabled) {
+                    # Is anything "inherited" from local property definitions?
+                    # Backtrack through collected hashmaps...
+                    my $nearestLE;  # local enabled
+                    my $nearestLR;  # local recursive
+                    my $nearestLEds;  # dataset with local enabled setting
+                    my $nearestLRds;  # dataset with local recursive setting
+                    my $ancestor = $dataSet;
+                    while ($ancestor ne $backupSet->{src}) {
+                        # Chop off last slash and dataset name after it
+                        my $idx = rindex($ancestor, '/');
+                        if ($idx == 0) {
+                            die "Did not expect to see a starting slash in dataset name in the loop under $backupSet->{src}: $dataSet => $ancestor"
+                        }
+                        elsif ($idx < 0) {
+                            # -1 means no slash, looking at a pool's root dataset
+                            # May be our starting point or last loop cycle, so process it?
+                            # Although $backupSet->{src} should have ruled it out anyway.
+                            # In any case, avoid infinite loop upon errors, bail out below.
+                            $self->zLog->debug("WARNING: Did not expect to see a root dataset name in the loop under $backupSet->{src}: $dataSet => $ancestor");
+                        } else {
+                            $ancestor = substr($ancestor, 0, $idx);
+                        }
+                        if ((!defined($nearestLE)) and defined($explicitEnabled{$ancestor})) {
+                            $nearestLE = $explicitEnabled{$ancestor};
+                            $nearestLEds = $ancestor;
+                        }
+                        if ((!defined($nearestLR)) and defined($explicitRecursiveLocal{$ancestor})) {
+                            $nearestLR = $explicitRecursiveLocal{$ancestor};
+                            $nearestLRds = $ancestor;
+                        }
+                        if (defined($nearestLE) and defined($nearestLR)) {
+                            last;
+                        }
+                        if ($idx < 1 || $ancestor eq $dataSet) {
+                            # Chopping did not go well
+                            last;
+                        }
+                    }
+
+                    if (defined($nearestLE)) {
+                        # Got something, is it "on" or "off", is recursion involved?
+                        if (defined($nearestLR)) {
+                            # Both properties are locally defined in some ancestor(s)
+                            if ($nearestLE eq "off" and $nearestLR eq "on" and $nearestLEds eq $nearestLRds) {
+                                # An ancestor defines both enabled==off and recursive==on
+                                # explicitly, and is the nearest one to define such things.
+                                $isDisabled = 1;
+                            }
+                            # else enabled=on, or recursive=off, or not set in same dataset
+                            elsif ($nearestLE eq "on" and $nearestLR eq "on" and $nearestLEds eq $nearestLRds) {
+                                # logical inheritance of "enabled=on"
+                                $isDisabled = -1;
+                            }
+                            # else enabled=on, or recursive=off, or not set in same dataset
+                            elsif ($nearestLE eq "on" and $nearestLR eq "off" and $nearestLEds eq $nearestLRds) {
+                                # logical inheritance of "enabled=..." from parent of that
+                                # ancestor because its own "enabled=on" is not recursive
+                                my $ancestor2 = $nearestLEds;
+                                while ($ancestor2) {
+                                    $ancestor2 =~ s/\/[^\/]+$// ;
+                                    if (grep {$_ eq $ancestor2} @dataSetsExplicitlyDisabled) {
+                                        # We handled that ancestor and found it disabled, in an earlier loop
+                                        $isDisabled = 1;
+                                        last;
+                                    }
+                                    if (index($ancestor2, '/') < 0) {
+                                        last;
+                                    }
+                                }
+                            }
+                            elsif ($nearestLE eq "on" and defined($propIR) and $propIR eq "on") {
+                                # zfs-inheritance of "enabled=on"
+                                $isDisabled = -1;
+                            }
+                        }   # else only "enabled=whatever" is defined in some ancestor, but
+                            # not "recursive" anywhere => this one remains enabled, probably
+                    }   # else no ancestor defines a local "enabled" setting
+                }
+
+                if (!$isDisabled) {
+                    if ($enabled_default eq 'off') {
+                        # Somehow processing a disabled backupSet?..
+                        $isDisabled = 1;
+                    } elsif ($enabled_default eq 'on') {
+                        $isDisabled = -1;
+                    }
+                }
+
+                $self->zLog->debug("=== $dataSet snapshotting: isDisabled=$isDisabled (" . ($isDisabled==1 ? "known-disabled" : ($isDisabled==-1 ? "known-enabled" : "uncertain")) . ")") if $self->debug;
+                if ($isDisabled == 1) {
+                    push(@dataSetsExplicitlyDisabled, $dataSet);
+                }
+            }
+        }
+    }
+
+    return \@dataSetsExplicitlyDisabled;
+};
+
 my $refreshBackupPlans = sub {
     my $self = shift;
     my $recurse = shift;
@@ -157,6 +372,13 @@ my $refreshBackupPlans = sub {
         or die "No backup set defined or enabled, yet. run 'znapzendzetup' to setup znapzend\n";
 
     for my $backupSet (@{$self->backupSets}){
+        $backupSet->{srcDisabledDescendants} = $self->$listDisabledSourceDescendants($backupSet);
+        if ($self->debug) {
+            for my $ds (@{$backupSet->{srcDisabledDescendants}}) {
+                $self->zLog->info('Found disabled sub-dataset: ' . $ds);
+            }
+        }
+
         $backupSet->{srcPlanHash} = $self->zTime->backupPlanToHash($backupSet->{src_plan});
         #check destination for remote pre-command
         for (keys %$backupSet){
@@ -185,6 +407,15 @@ my $refreshBackupPlans = sub {
         #create backup hashes for all destinations
         for (keys %$backupSet){
             my ($key) = /^dst_([^_]+)_plan$/ or next;
+            my $autoCreation = $self->autoCreation;
+            if (!defined($autoCreation)) {
+                # Caller did not require any particular behavior, so
+                # check the ZFS property name (note lower-case "c"):
+                $autoCreation = (exists $backupSet->{"dst_$key" . '_autocreation'} ? $backupSet->{"dst_$key" . '_autocreation'} : undef);
+            }
+            if (!defined($autoCreation)) {
+                $autoCreation = 0;
+            }
 
             #check if destination exists (i.e. is valid) otherwise recheck as dst might be online, now
             if (!$backupSet->{"dst_$key" . '_valid'}){
@@ -192,7 +423,10 @@ my $refreshBackupPlans = sub {
                 $backupSet->{"dst_$key" . '_valid'} =
                     $self->zZfs->dataSetExists($backupSet->{"dst_$key"}) or do {
 
-                    if ($self->autoCreation && !$self->sendRaw) {
+                    # Do not automatically create destination when using
+                    # feature sendRaw, receiving a raw encrypted stream
+                    # is not supported on unencrypted datasets
+                    if ($autoCreation && !$self->sendRaw) {
                         my ($zpool) = $backupSet->{"dst_$key"} =~ /(^[^\/]+)\//;
 
                         # check if we can access destination zpool, if so create parent dataset
@@ -210,8 +444,10 @@ my $refreshBackupPlans = sub {
                     $backupSet->{"dst_$key" . '_valid'} or
                         $self->zLog->warn("destination '" . $backupSet->{"dst_$key"}
                             . "' does not exist or is offline. will be rechecked every run..."
-                            . ( $self->autoCreation ? "" : " Consider running znapzend --autoCreation" ) );
+                            . ( $autoCreation ? "" : " Consider running znapzend --autoCreation" ) );
                 };
+
+                $self->zLog->debug('refreshBackupPlans(): detected dst_' . $key . '_valid status for ' . $backupSet->{"dst_$key"} . ': ' . $backupSet->{"dst_$key" . '_valid'}) if ($self->debug);
             }
             $backupSet->{"dst$key" . 'PlanHash'}
                 = $self->zTime->backupPlanToHash($backupSet->{"dst_$key" . '_plan'});
@@ -298,6 +534,11 @@ my $sendRecvCleanup = sub {
     my $srcSubDataSets = $backupSet->{recursive} eq 'on'
         ? $self->zZfs->listSubDataSets($backupSet->{src}) : [ $backupSet->{src} ];
 
+    my @dataSetsExplicitlyDisabled = ();
+    if (defined($backupSet->{srcDisabledDescendants})) {
+        @dataSetsExplicitlyDisabled = @{$backupSet->{srcDisabledDescendants}};
+    }
+
     #loop through all destinations
     for my $dst (sort grep { /^dst_[^_]+$/ } keys %$backupSet){
         my ($key) = $dst =~ /dst_([^_]+)$/;
@@ -337,13 +578,32 @@ my $sendRecvCleanup = sub {
         #recheck non valid dst as it might be online, now
         if (!$backupSet->{"dst_$key" . '_valid'}) {
 
+            my $autoCreation = $self->autoCreation;
+            if (!defined($autoCreation)) {
+                # Caller did not require any particular behavior, so
+                # check the ZFS property name (note lower-case "c").
+                # Note we are looking at "root" datasets with a backup
+                # schedule here (enumerated earlier); children if any
+                # would be checked below:
+                $autoCreation = (exists $backupSet->{"dst_$key" . '_autocreation'} ? $backupSet->{"dst_$key" . '_autocreation'} : undef);
+            }
+            if (!defined($autoCreation)) {
+                $autoCreation = 0;
+            }
+
             $backupSet->{"dst_$key" . '_valid'} =
                 $self->zZfs->dataSetExists($backupSet->{"dst_$key"}) or do {
 
-                if ($self->autoCreation && !$self->sendRaw) {
+                # Do not automatically create destination when using
+                # feature sendRaw, receiving a raw encrypted stream
+                # is not supported on unencrypted datasets
+                if ($autoCreation && !$self->sendRaw) {
                     my ($zpool) = $backupSet->{"dst_$key"} =~ /(^[^\/]+)\//;
 
-                    # check if we can access destination zpool, if so create parent dataset
+                    # check if we can access destination zpool, if so -
+                    # create parent dataset (e.g. this backupSet root;
+                    # note that if we recurse into children that may be
+                    # absent, they are treated separately below)
                     $self->zZfs->dataSetExists($zpool) && do {
                         $self->zLog->info("creating destination dataset '" . $backupSet->{"dst_$key"} . "'...");
 
@@ -355,15 +615,25 @@ my $sendRecvCleanup = sub {
                         }
                     };
                 }
-                ( $backupSet->{"dst_$key" . '_valid'} || ($self->sendRaw && $self->autoCreation) ) or do {
+                # TOTHINK: Is the sendRaw comparison correct here for the intent
+                # and purpose of PR https://github.com/oetiker/znapzend/pull/496 ?
+                ( $backupSet->{"dst_$key" . '_valid'} || ($self->sendRaw && $autoCreation) ) or do {
                     my $errmsg = "destination '" . $backupSet->{"dst_$key"}
-                        . "' does not exist or is offline. ignoring it for this round...";
-                    $self->zLog->warn($errmsg);
-                    push (@sendFailed, $errmsg);
-                    $thisSendFailed = 1;
+                        . "' does not exist or is offline; ignoring it for this round...";
+                    # Avoid spamming for every loop cycle, if we do not have
+                    # the dataset and know we do not intend to auto-create it
+                    $self->zLog->warn($errmsg) if ($autoCreation or $self->debug);
+                    if (!$autoCreation) {
+                        $self->zLog->warn("Autocreation is disabled for this dataset or whole run, so skipping without error") if ($self->debug);
+                    } else {
+                        push (@sendFailed, $errmsg);
+                        $thisSendFailed = 1;
+                    }
                     next;
                 };
             };
+
+            $self->zLog->debug('sendRecvCleanup(): detected dst_' . $key . '_valid status for ' . $backupSet->{"dst_$key"} . ': ' . $backupSet->{"dst_$key" . '_valid'}) if ($self->debug);
         }
 
         #sending loop through all subdatasets
@@ -376,8 +646,55 @@ my $sendRecvCleanup = sub {
             my $dstDataSet = $srcDataSet;
             $dstDataSet =~ s/^\Q$backupSet->{src}\E/$backupSet->{$dst}/;
 
-            $self->zLog->debug('sending snapshots from ' . $srcDataSet . ' to ' . $dstDataSet);
-            {
+            my $autoCreation = $self->autoCreation;
+            if (!defined($autoCreation)) {
+                # Caller did not require any particular behavior, so
+                # check the ZFS property name (note lower-case "c").
+                # Look at properties of this dataset, allow inherited
+                # values. TOTHINK: Get properties once for all tree?
+                my $properties = $self->zZfs->getDataSetProperties($srcDataSet, 0, 1);
+                if ($properties->[0]) {
+                    for my $prop (keys %{$properties->[0]}) {
+                        if ($prop eq "dst_$key" . '_autocreation') {
+                            $autoCreation = (%{$properties->[0]}{$prop} eq "on" ? 1 : 0);
+                            last;
+                        }
+                    }
+                }
+            }
+            if (!defined($autoCreation)) {
+                $autoCreation = 0;
+            }
+
+            my $srcDataSetDisabled = (grep (/^\Q$srcDataSet\E$/, @dataSetsExplicitlyDisabled));
+            $self->zLog->debug('sending snapshots from ' . $srcDataSet . ' to ' . $dstDataSet .
+                ($srcDataSetDisabled ? ": not enabled, skipped" : ""));
+            if ($srcDataSetDisabled) {
+                next;
+            }
+
+            # Time to check if the target sub-dataset exists at all.
+            # We only skip it when autoCreation is disabled: with
+            # autoCreation enabled a missing destination is created
+            # either here (createDataSet, for plain sends) or by the
+            # receiving side. In particular a raw encrypted stream
+            # (feature sendRaw) MUST be received into a dataset that
+            # 'zfs recv -w' creates itself, so that it becomes the
+            # encryption root; pre-creating it would break the receive.
+            # Hence for sendRaw we do not create it here, but we also
+            # must not skip it - the send/recv below creates it.
+            if (!$autoCreation && !($self->zZfs->dataSetExists($dstDataSet))) {
+                my $errmsg = "sub-destination '" . $dstDataSet
+                    . "' does not exist or is offline; ignoring it for this round... Consider "
+                    . "running znapzend --autoCreation or "
+                    . "disabling this dataset from znapzend handling.";
+                # Autocreation is disabled for this dataset or whole run,
+                # so skip without error. Avoid log spam unless debugging.
+                $self->zLog->warn($errmsg) if $self->debug;
+                next;
+            }
+
+            {   # scoping
                 local $@;
                 eval {
                     local $SIG{__DIE__};
@@ -385,8 +702,12 @@ my $sendRecvCleanup = sub {
                         'since=="' . $self->since . '"'.
                         ', skipIntermediates=="' . $self->skipIntermediates . '"' .
                         ', forbidDestRollback=="' . $self->forbidDestRollback . '"' .
+                        ', autoCreation=="' . ( $autoCreation ? "true" : "false" ) . '"' .
+                        ', sendRaw=="' . $self->sendRaw . '"' .
+                        ', valid=="' . ( $backupSet->{"dst_$key" . '_valid'} ? "true" : "false" ) . '"' .
                         ', justCreated=="' . ( $backupSet->{"dst_$key" . '_justCreated'} ? "true" : "false" ) . '"'
                         ) if $self->debug;
+
                     if ($self->since) {
                         # Make sure that if we use the "--sinceForced=X" or
                         # "--since=X" option, this named snapshot exists (or
@@ -594,9 +915,11 @@ my $sendRecvCleanup = sub {
                                             $lastSnapshotToSee = ${$srcSnapshots}[$seenX];
                                         }
                                         $self->zZfs->sendRecvSnapshots($srcDataSet, $dstDataSet, $dst,
-                                                $backupSet->{mbuffer}, $backupSet->{mbuffer_size},
+                                                $backupSet->{src_mbuffer}, $backupSet->{src_mbuffer_size},
+                                                $backupSet->{"dst_$key" . '_mbuffer'}, $backupSet->{"dst_$key" . '_mbuffer_size'},
                                                 $backupSet->{snapSendFilter}, $lastSnapshotToSee,
-                                                ( $backupSet->{"dst_$key" . '_justCreated'} ? 1 : ($doPromote > 1 ? $doPromote : undef ) )
+                                                ( $backupSet->{"dst_$key" . '_justCreated'} ? 1 : ($doPromote > 1 ? $doPromote : undef ) ),
+                                                $backupSet->{src_mbuffer_param}, $backupSet->{"dst_$key" . '_mbuffer_param'}
                                             );
                                     } else {
                                         $self->zLog->debug("sendRecvCleanup() [--since mode]: We considered --since='" . $self->since . "' and did not find reasons to use sendRecvSnapshots() explicitly to make it appear in $dstDataSet");
@@ -623,9 +946,11 @@ my $sendRecvCleanup = sub {
                     # Note this can fail if we forbidDestRollback and there are
                     # snapshots or data on dst newer than the last common snap.
                     $self->zZfs->sendRecvSnapshots($srcDataSet, $dstDataSet, $dst,
-                        $backupSet->{mbuffer}, $backupSet->{mbuffer_size},
+                        $backupSet->{src_mbuffer}, $backupSet->{src_mbuffer_size},
+                        $backupSet->{"dst_$key" . '_mbuffer'}, $backupSet->{"dst_$key" . '_mbuffer_size'},
                         $backupSet->{snapSendFilter}, undef,
-                        ( $backupSet->{"dst_$key" . '_justCreated'} ? 1 : undef )
+                        ( $backupSet->{"dst_$key" . '_justCreated'} ? 1 : undef ),
+                        $backupSet->{src_mbuffer_param}, $backupSet->{"dst_$key" . '_mbuffer_param'}
                         );
                 };
                 if (my $err = $@){
@@ -1039,46 +1364,28 @@ my $createSnapshot = sub {
         }
     }
 
-    # Remove snapshots from descendant subsystems that have the property
-    # "enabled" set to "off", if the "recursive" flag is set to "on",
-    # so their newly created snapshots are discarded quickly and disk
-    # space is not abused by something we do not back up subsequently.
+    # First we snapshot the backupSet recursively and atomically, but
+    # later we would remove snapshots from descendant subsystems that
+    # have the property "enabled" set to "off", if the "recursive" flag
+    # is set to "on", so their newly created snapshots are discarded
+    # quickly and disk space is not abused by something we do not back
+    # up subsequently (it might still become blocked if znapzend crashes
+    # or the host reboots between such snapshot creation and clean-up).
     # This only applies if we made a single-command recursive snapshot.
-    if ($backupSet->{recursive} eq 'on') {
+    my @dataSetsExplicitlyDisabled = ();
+    if (defined($backupSet->{srcDisabledDescendants})) {
+        @dataSetsExplicitlyDisabled = @{$backupSet->{srcDisabledDescendants}};
+    }
 
-        $self->zLog->info("checking for explicitly excluded ZFS dependent datasets under '$backupSet->{src}'");
-
-        # restrict the list to the datasets that are descendant from the current
-        ###my @dataSetList = grep /^$backupSet->{src}($|\/)/, @{$self->zZfs->listDataSets()};
-        my @dataSetList = @{$self->zZfs->listDataSets(undef, $backupSet->{src}, 1)};
-        if ( @dataSetList ) {
-
-            # for each dataset: if the property "enabled" is set to "off", set the
-            # newly created snapshot for removal
-            my @dataSetsExplicitlyDisabled = ();
-            for my $dataSet (@dataSetList){
-
-                # get the value for org.znapzend property
-                my @cmd = (@{$self->zZfs->priv}, qw(zfs get -H -s local -o value org.znapzend:enabled), $dataSet);
-                print STDERR '# ' . join(' ', @cmd) . "\n" if $self->debug;
-                open my $prop, '-|', @cmd;
-
-                # if the property does not exist, the command will just return. In this case,
-                # the value is implicit "on"
-                $prop = <$prop> || "on";
-                chomp($prop);
-                if ( $prop eq 'off' ) {
-                    push(@dataSetsExplicitlyDisabled, $dataSet . '@' . $snapshotSuffix);
-                }
-            }
-
-            # remove the snapshots previously marked
-            # removal here is non-recursive to allow for fine-grained control
-            if ( @dataSetsExplicitlyDisabled ){
-               $self->zLog->info("Requesting removal of marked datasets: ". join( ", ", @dataSetsExplicitlyDisabled));
-               $self->zZfs->destroySnapshots(@dataSetsExplicitlyDisabled, 0);
-           }
+    # Remove the snapshots previously marked (if any). Note that the
+    # removal here is non-recursive to allow for fine-grained control:
+    if (@dataSetsExplicitlyDisabled) {
+        my @snapshotsToRemove = ();
+        for my $dataSet (@dataSetsExplicitlyDisabled) {
+            push (@snapshotsToRemove, $dataSet . '@' . $snapshotSuffix);
         }
+        $self->zLog->info("Requesting removal of marked snapshots from \"disabled\" datasets: ". join( ", ", @snapshotsToRemove));
+        $self->zZfs->destroySnapshots(\@snapshotsToRemove, 0);
     }
 
     #clean up env variables
@@ -1088,7 +1395,48 @@ my $createSnapshot = sub {
     return 1;
 };
 
-my $sendWorker = sub {
+# Concurrency gate for send/receive workers (see --maxConcurrentSends /
+# --serialize). Kept as named methods so the queueing logic can be unit-tested
+# directly, independent of the fork machinery in sendWorker.
+
+# Try to claim a send slot for this backup set. Returns 1 if the caller may
+# start the send now, or 0 if the configured limit is reached, in which case
+# the [backupSet, timeStamp] pair is queued for later dispatch.
+#
+# The backup set is flagged 'send_queued' while it waits in the queue. A queued
+# send never spawns, so its 'send_pid' stays 0; without this flag, snapWorker's
+# "previous send still running" guard (which only checks send_pid) would let the
+# next interval enqueue the same set again. The flag is cleared once the set
+# actually claims a slot (here, including when dispatched from the queue).
+sub _claimSendSlot {
+    my ($self, $backupSet, $timeStamp) = @_;
+    if ($self->maxConcurrentSends > 0
+        && $self->_activeSends >= $self->maxConcurrentSends) {
+        $backupSet->{send_queued} = 1;
+        push @{$self->_sendQueue}, [$backupSet, $timeStamp];
+        return 0;
+    }
+    $backupSet->{send_queued} = 0;
+    $self->_activeSends($self->_activeSends + 1);
+    return 1;
+}
+
+# Release the send slot held by a finished send and return the next queued
+# [backupSet, timeStamp] to dispatch (the caller passes it back to sendWorker,
+# which re-claims the slot), or undef if nothing is waiting / still at the limit.
+sub _releaseSendSlot {
+    my ($self) = @_;
+    $self->_activeSends($self->_activeSends - 1) if $self->_activeSends > 0;
+    if (@{$self->_sendQueue}
+        && ($self->maxConcurrentSends <= 0
+            || $self->_activeSends < $self->maxConcurrentSends)) {
+        return shift @{$self->_sendQueue};
+    }
+    return undef;
+}
+
+my $sendWorker;
+$sendWorker = sub {
     my $self = shift;
     my $backupSet = shift;
     my $timeStamp = shift;
@@ -1097,46 +1445,91 @@ my $sendWorker = sub {
 ### RM_COMM_4_TEST ###  $self->$sendRecvCleanup($backupSet, $timeStamp);
 ### RM_COMM_4_TEST ###  return;
 
+    # Limit/serialize concurrent send-receive processes if requested via
+    # --maxConcurrentSends (0 == unlimited, the default and legacy behavior;
+    # --serialize is shorthand for 1). Several backup sets coming due at the
+    # same instant would otherwise each fork their own send pipeline at once.
+    # _claimSendSlot() accounts for in-flight sends synchronously (send_pid is
+    # only set asynchronously on the 'spawn' event, so it cannot be counted
+    # reliably here) and queues this send if we are already at the limit; a
+    # finishing send dispatches the next queued one from its callback below.
+    if (!$self->_claimSendSlot($backupSet, $timeStamp)) {
+        $self->zLog->info('send/receive for ' . $backupSet->{src}
+            . ' queued: all ' . $self->maxConcurrentSends
+            . ' send slot(s) busy');
+        return;
+    }
+
+    # Free this send slot and start the next queued send (if any). Guarded so
+    # it runs at most once per send even if both the completion callback and
+    # the error event fire.
+    my $slotReleased = 0;
+    my $releaseSlot = sub {
+        return if $slotReleased;
+        $slotReleased = 1;
+        if (my $next = $self->_releaseSendSlot) {
+            $self->$sendWorker(@$next);
+        }
+    };
+
     #send/receive fork
-    my $fc = Mojo::IOLoop::ForkCall->new;
-    $fc->run(
-        #send/receive worker
-        $sendRecvCleanup,
-        #send/receive worker arguments
-        [$self, $backupSet, $timeStamp],
-        #send/receive worker callback
-        sub {
-            my ($fc, $err) = @_;
+    # Wrapped in eval so that if the subprocess cannot even be set up/started
+    # (a synchronous failure, before either callback can fire), we still free
+    # the slot we just claimed and dispatch any queued send - otherwise sends
+    # queued behind this one would stall. The $slotReleased guard keeps this
+    # safe if the asynchronous 'error' event also fires for the same failure.
+    eval {
+        my $subprocess = Mojo::IOLoop::Subprocess->new;
+        $subprocess->run(
+            #send/receive worker
+            sub {
+                return $sendRecvCleanup->($self, $backupSet, $timeStamp);
+            },
+            #send/receive worker callback
+            sub {
+                my ($subprocess, $err) = @_;
 
-            $self->zLog->warn('send/receive for ' . $backupSet->{src}
-                . ' failed: ' . $err) if $err;
+                $self->zLog->warn('send/receive for ' . $backupSet->{src}
+                    . ' failed: ' . $err) if $err;
 
-            $self->zLog->debug('send/receive worker for ' . $backupSet->{src}
-                . " done ($backupSet->{send_pid})");
-            #send/receive process finished, clear pid from backup set
-            $backupSet->{send_pid} = 0;
-        }
-    );
+                $self->zLog->debug('send/receive worker for ' . $backupSet->{src}
+                    . " done ($backupSet->{send_pid})");
+                #send/receive process finished, clear pid from backup set
+                $backupSet->{send_pid} = 0;
 
-    #spawn event
-    $fc->on(
-        spawn => sub {
-            my ($fc, $pid) = @_;
+                $releaseSlot->();
+            }
+        );
 
-            $self->zLog->debug('send/receive worker for ' . $backupSet->{src}
-                . " spawned ($pid)");
-            $backupSet->{send_pid} = $pid;
-        }
-    );
+        #spawn event
+        $subprocess->on(
+            spawn => sub {
+                my ($subprocess) = @_;
+                my $pid = $subprocess->pid;
 
-    #error event
-    $fc->on(
-        error => sub {
-            my ($fc, $err) = @_;
+                $self->zLog->debug('send/receive worker for ' . $backupSet->{src}
+                    . " spawned ($pid)");
+                $backupSet->{send_pid} = $pid;
+            }
+        );
 
-            $self->zLog->warn($err) if !$self->terminate;
-        }
-    );
+        #error event
+        $subprocess->on(
+            error => sub {
+                my ($subprocess, $err) = @_;
+
+                $self->zLog->warn($err) if !$self->terminate;
+                $releaseSlot->();
+            }
+        );
+
+        1;
+    } or do {
+        my $err = $@;
+        $self->zLog->warn('send/receive for ' . $backupSet->{src}
+            . ' could not be started: ' . $err) if !$self->terminate;
+        $releaseSlot->();
+    };
 };
 
 my $snapWorker = sub {
@@ -1150,15 +1543,15 @@ my $snapWorker = sub {
 ### RM_COMM_4_TEST ###  return;
 
     #snapshot fork
-    my $fc = Mojo::IOLoop::ForkCall->new;
-    $fc->run(
+    my $subprocess = Mojo::IOLoop::Subprocess->new;
+    $subprocess->run(
         #snapshot worker
-        $createSnapshot,
-        #snapshot worker arguments
-        [$self, $backupSet, $timeStamp],
+        sub {
+            return $createSnapshot->($self, $backupSet, $timeStamp);
+        },
         #snapshot worker callback
         sub {
-            my ($fc, $err) = @_;
+            my ($subprocess, $err) = @_;
 
             $self->zLog->warn('taking snapshot on ' . $backupSet->{src}
                 . ' failed: ' . $err) if $err;
@@ -1172,6 +1565,10 @@ my $snapWorker = sub {
                 $self->zLog->info('previous send/receive process on ' . $backupSet->{src}
                     . ' still running! skipping this round...');
             }
+            elsif ($backupSet->{send_queued}){
+                $self->zLog->info('previous send/receive process on ' . $backupSet->{src}
+                    . ' still queued (waiting for a send slot)! skipping this round...');
+            }
             else{
                 $self->$sendWorker($backupSet, $timeStamp);
             }
@@ -1179,9 +1576,10 @@ my $snapWorker = sub {
     );
 
     #spawn event
-    $fc->on(
+    $subprocess->on(
         spawn => sub {
-            my ($fc, $pid) = @_;
+            my ($subprocess) = @_;
+            my $pid = $subprocess->pid;
 
             $self->zLog->debug('snapshot worker for ' . $backupSet->{src}
                 . " spawned ($pid)");
@@ -1190,9 +1588,9 @@ my $snapWorker = sub {
     );
 
     #error event
-    $fc->on(
+    $subprocess->on(
         error => sub {
-            my ($fc, $err) = @_;
+            my ($subprocess, $err) = @_;
 
             $self->zLog->warn($err) if !$self->terminate;
         }

@@ -1,8 +1,8 @@
 
 ##### Builder image
-ARG PERL_BUILD_VERSION=5.30-buster
-ARG ALPINE_VERSION=3.11
-FROM docker.io/library/perl:${PERL_BUILD_VERSION} as builder
+ARG PERL_BUILD_VERSION=5.38-buster
+ARG ALPINE_VERSION=3.19
+FROM docker.io/library/perl:${PERL_BUILD_VERSION} AS builder
 
 WORKDIR /usr/local/src
 
@@ -15,15 +15,20 @@ RUN \
   make install
 
 ##### Runtime image
-FROM docker.io/library/alpine:${ALPINE_VERSION} as runtime
-
-ARG PERL_VERSION=5.30.3-r0
+FROM docker.io/library/alpine:${ALPINE_VERSION} AS runtime
 
 RUN \
+  # mbuffer is not in main currently, and community keys expire over time,
+  # so gotta bump ALPINE_VERSION above regularly. Request its package first to
+  # fail fast in such case. Note that while "--allow-untrusted" might be an
+  # option, shared libraries referenced by the binary make an older distro
+  # outdated.
+  apk add --no-cache --repository http://dl-cdn.alpinelinux.org/alpine/edge/community/ mbuffer && \
+  # perl is intentionally left unpinned: Alpine patch-bumps it within a stable
+  # branch (e.g. 5.38.2-r0 -> 5.38.5-r0), so pinning an exact -rN release breaks
+  # the build over time. The chosen ALPINE_VERSION already fixes the 5.x series.
   # nano is for the interactive "edit" command in znapzendzetup if preferred over vi
-  apk add --no-cache zfs curl bash autoconf automake nano perl=${PERL_VERSION} openssh && \
-  # mbuffer is not in main currently
-  apk add --no-cache --repository http://dl-3.alpinelinux.org/alpine/edge/community/ mbuffer && \
+  apk add --no-cache zfs curl bash autoconf automake nano perl openssh && \
   ln -s /dev/stdout /var/log/syslog && \
   ln -s /usr/bin/perl /usr/local/bin/perl
 
@@ -38,7 +43,11 @@ ENTRYPOINT [ "/bin/bash", "-c" ]
 CMD [ "znapzend --logto=/dev/stdout" ]
 
 ##### Tests
-FROM builder as test
+FROM builder AS test
+
+RUN \
+  cpan Devel::Cover && \
+  cpan Test::SharedFork
 
 RUN \
   ./test.sh

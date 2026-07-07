@@ -5,6 +5,7 @@ use FindBin; use lib "$FindBin::RealBin/../lib", "$FindBin::RealBin/../thirdpart
 
 use Getopt::Long qw(:config posix_default no_ignore_case);
 use Pod::Usage;
+use Role::Tiny;
 
 use ZnapZend;
 my $VERSION = '0.dev'; #VERSION
@@ -15,7 +16,7 @@ sub main {
     my $opts = {};
     GetOptions($opts, qw(help|h man debug|d noaction|n nodestroy features=s),
         qw(sudo pfexec rootExec=s daemonize pidfile=s logto=s loglevel=s),
-        qw(runonce:s connectTimeout=s timeWarp=i nodelay autoCreation version),
+        qw(runonce:s connectTimeout=s timeWarp=i nodelay autoCreation noautoCreation version),
         qw(forcedSnapshotSuffix=s forbidDestRollback),
         qw(skipIntermediates|i sendIntermediates|I),
             # Note: the intended usage is either via feature as done
@@ -23,7 +24,7 @@ sub main {
             # for "zfs send", so the longer variants --skipIntermediates
             # vs. --sendIntermediates are not documented in the manpage.
         qw(skipOnPreSnapCmdFail skipOnPreSendCmdFail recursive|r inherited since=s sinceForced=s),
-        qw(cleanOffline mailErrorSummaryTo=s)
+        qw(cleanOffline mailErrorSummaryTo=s serialize maxConcurrentSends=i)
         ) or exit 1;
 
     $opts->{version} && do {
@@ -43,6 +44,19 @@ sub main {
             }
         }
         delete $opts->{features};
+    }
+
+    # --serialize is shorthand for --maxConcurrentSends=1 (run sends one at a
+    # time). The default of 0 means unlimited, i.e. the legacy behavior.
+    if (defined($opts->{serialize})) {
+        if (defined($opts->{maxConcurrentSends}) && $opts->{maxConcurrentSends} != 1) {
+            warn "Options --serialize and --maxConcurrentSends=$opts->{maxConcurrentSends} conflict; --serialize wins (using 1)\n";
+        }
+        $opts->{maxConcurrentSends} = 1;
+        delete $opts->{serialize};
+    }
+    if (defined($opts->{maxConcurrentSends}) && $opts->{maxConcurrentSends} < 0) {
+        die "ERROR: --maxConcurrentSends must be a non-negative integer (0 == unlimited)\n";
     }
 
     if (defined($opts->{sendIntermediates})) {
@@ -82,6 +96,18 @@ sub main {
         $opts->{forbidDestRollback} = 1;
     } else {
         $opts->{forbidDestRollback} = 0;
+    }
+
+    # Note: default is "undef" to use a ZFS property dst_N_autocreation
+    # (lower-case "c" in the name) if present; finally assumes 0 (false)
+    # if not set in any configuration source for a particular dataset.
+    if (defined($opts->{noautoCreation})) {
+        $opts->{autoCreation} = 0;
+        delete $opts->{noautoCreation};
+    } else {
+        if (defined($opts->{autoCreation})) {
+            $opts->{autoCreation} = 1;
+        }
     }
 
     if (defined($opts->{sinceForced}) && ($opts->{sinceForced} eq '')) {
@@ -180,6 +206,7 @@ B<znapzend> [I<options>...]
  --forbidDestRollback   forbids forcing destination dataset rollback and
                         removal of datasets/snapshots not present on source
  --logto=x              select where to log (syslog::<facility> or <filepath>)
+                        when logging to a file, send USR1 to re-open the filehandle
  --loglevel=x           define the log level
  --pidfile=x            write a pid file when running in daemon mode
  --daemonize            fork into the background
@@ -200,6 +227,8 @@ B<znapzend> [I<options>...]
  --connectTimeout=x     sets the ConnectTimeout for ssh commands
  --autoCreation         automatically create dataset on destination if it does
                         not exist
+ --noautoCreation       avoid automatically creating a dataset on destination
+                        if it does not exist (default)
  --timeWarp=x           shift znapzend's sense of NOW into the future
                         by x seconds
  --skipOnPreSnapCmdFail skip snapshots if the pre-snap-command fails
@@ -255,6 +284,8 @@ regularly scheduled operations.
 send logs out to either syslog or a logfile. Default is to send logs to
 B<syslog::daemon> when running daemonized. When running in debug mode, the
 logs will go to STDERR by default.
+
+When logging to a file, send USR1 to reopen the file handle after log rotation.
 
 Examples:
 
@@ -606,9 +637,27 @@ sets the ssh connection timeout (in seconds)
 
 Automatically create a dataset on a destination host if it's not there yet.
 
+This works together with the I<sendRaw> feature: for a raw (encrypted)
+stream the destination dataset is not pre-created (a raw encrypted stream
+must be received into a dataset that C<zfs recv -w> creates itself, so that
+it becomes the encryption root); the initial send/receive creates it instead.
+
+Note that with I<sendRaw> only the destination leaf dataset is created (by the
+receive); znapzend does not pre-create missing intermediate parent datasets in
+that mode. The destination's parent must already exist - this is the common
+case where the parent is the destination pool, or (for recursive sends) a
+parent dataset created by an earlier send in the same run. For plain
+(non-raw) sends znapzend creates the destination path with C<zfs create -p>.
+
+=item B<--noautoCreation>
+
+Avoid automatically creating a dataset on a destination host if it's not
+there yet. This is the default behavior; the option is available to help
+explicitly override a setting inherited from a configuration file, etc.
+
 =item B<--timeWarp>=x
 
-Shift ZnapZends sense of time into the future by x seconds.
+Shift ZnapZend's sense of time into the future by x seconds.
 
 The practical application if this function is to determine what will happen
 at some future point in time. This can be useful for testing but also when
@@ -646,6 +695,24 @@ system setup to validate the recipient names (local or domain-suffixed) and
 deliver the message to some mailbox.
 
 This feature relies on a program which supports standard sendmail-like CLI.
+
+=item B<--maxConcurrentSends>=I<count>
+
+Limit the number of send/receive processes running at the same time across all
+backup sets to I<count>. The default is C<0>, meaning unlimited (the legacy
+behavior): when several backup sets come due at once, each starts its own
+C<zfs send | mbuffer | ... | zfs recv> pipeline in parallel.
+
+Setting a limit makes the additional sends wait in a queue and start as running
+ones finish. This dedicates more bandwidth to each individual stream (instead of
+splitting it across many parallel ones), avoids a single network hiccup failing
+all transfers at once, and reduces concurrent write churn on the destination
+pool. Snapshot creation is local and cheap and is not affected by this limit.
+
+=item B<--serialize>
+
+Shorthand for B<--maxConcurrentSends>=1: run send/receive operations strictly
+one at a time.
 
 =back
 

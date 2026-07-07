@@ -263,6 +263,18 @@ my $command = shift @ARGV or exit 1;
 # combos are provided. Note the leading space for simpler matchers.
 my $ARGSTR = join(" ", '', @ARGV);
 
+# Optionally record every invoked subcommand (and its arguments) to a file
+# so tests can assert exactly what was run - e.g. that a raw (encrypted)
+# autoCreation does NOT 'zfs create' the destination leaf but DOES
+# 'zfs recv' into it, while a plain autoCreation 'zfs create's it.
+# Appends are line-buffered so this is safe for the synchronous test path.
+if (defined($ENV{ZNAPZENDTEST_ZFS_RECORD}) && $ENV{ZNAPZENDTEST_ZFS_RECORD} ne '') {
+    if (open(my $rec, '>>', $ENV{ZNAPZENDTEST_ZFS_RECORD})) {
+        print $rec join(' ', $command, @ARGV) . "\n";
+        close $rec;
+    }
+}
+
 for ($command){
     /^(?:set|inherit|send|recv|create)$/ && do {
         if ( envval("ZNAPZENDTEST_ZFS_FAIL_$command") ) {
@@ -289,16 +301,22 @@ for ($command){
             print STDERR "failed to list mock dataset(s)\n";
             exit 1;
         }
-        if ($ARGV[4] && $ARGV[3] eq '-t' && $ARGV[4] eq 'snapshot'){
+        if ($ARGV[4] && $ARGV[3] eq '-t' && $ARGV[4] eq 'snapshot') {
             if ($ARGV[-1] =~ /^[^\@]+\@[^\@]+$/){
                 print $ARGV[-1] . "\n";
                 exit;
             }
             exit 1 if !exists $dataSets{$ARGV[-1]};
-            my $snapCount = ($dataSets{$ARGV[-1]} eq 'src') ? 60 : 58;
-            #get timestamp rounded to minutes
+            my $snapCount = envval('ZNAPZENDTEST_ZFS_list_max_snapshots');
+            if (!defined($snapCount) || $snapCount !~ /^\d+$/) {
+                $snapCount = 58; # +2 for src
+            }
+            if ($dataSets{$ARGV[-1]} eq 'src') {
+                $snapCount += 2;
+            }
+            # Get timestamp rounded to minutes
             my $time = localtime(int(time / 60) * 60 - 3600);
-            for (my $i = 0; $i < $snapCount; $i++){
+            for (my $i = 0; $i < $snapCount; $i++) {
                 print $ARGV[-1] . '@' . $time->strftime('%Y-%m-%d-%H%M%S') . "\n";
                 $time += 60;
             }
